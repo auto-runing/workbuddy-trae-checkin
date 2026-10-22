@@ -30,6 +30,7 @@
 | Secret          | `MASTER_KEY`  | 32 字节随机值的 base64，两个平台共用                        |
 | Secret          | `ADMIN_TOKEN` | 你自己定的**页面登录密码**                                |
 | Secret          | `CRON_SECRET` | 可选。给 `/cron` 用的独立口令，不配则回落到 `ADMIN_TOKEN`       |
+| 变量 / Secret     | `TRAE_ALLOWED_HOSTS` | 可选。Trae 兑令牌允许的 host 白名单，逗号分隔，见下方「兑换 host 白名单」 |
 
 1. **Settings → Triggers → Cron Triggers** 加一条 `10 0 * * *`（= 北京时间 08:10）
 
@@ -82,6 +83,39 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 **本项目不采用任何本机程序**：不装客户端、不跑本地转发脚本、不监听端口。代价就是每个人每个账号多按一次 `Ctrl+V`，收益是任何一台设备打开网页就能用。
 
 > 设备密钥（ECDSA P-256）由 Worker 现场生成并加密保存，续期时的设备证明也由自己签名——**不需要装 Trae 客户端**。
+
+#### 兑换 host 白名单（`TRAE_ALLOWED_HOSTS`）
+
+扫码最后一步粘回来的链接形如：
+
+```
+http://127.0.0.1:17388/authorize?authCodeInfo=…&host=api.trae.cn&…
+```
+
+Worker 会拿其中的 `host` 当**兑换令牌请求的目标域名**，把 `AuthCode`、`CodeVerifier` 和设备公钥发过去。这段内容是人工粘贴的，如果允许任意 host，一条伪造的 `…&host=evil.com` 链接就能把这几个凭据送到第三方服务器。
+
+默认白名单只有两个官方域名，**什么都不配也能正常用**：
+
+```
+api.trae.cn
+api.trae.com.cn
+```
+
+需要切换或增加域名时，在 Worker 的 **Settings → Variables and Secrets** 加一条（类型选「变量」或「Secret」都可以）：
+
+| 名称                   | 值                                         |
+| -------------------- | ----------------------------------------- |
+| `TRAE_ALLOWED_HOSTS` | `api.trae.cn,api.trae.com.cn,api.example.com` |
+
+规则：
+
+- 逗号或空格分隔，可带端口，大小写不敏感
+- **配了就整体替换默认值**，不再自动包含官方域名，要保留请自己写进去
+- 匹配只比对主机名：`api.trae.cn:443` 命中 `api.trae.cn`，但 `evil.com:443` 照样被拒
+- 支持路径前缀（如 `api.example.com/gw`），会原样拼到请求地址上
+- 一项都不命中时直接报错并列出当前允许的域名，**不会发出任何请求**
+
+> 改完变量要重新 **Deploy**（或等 Dashboard 保存后生效）才会读到新值。日常使用不需要动这一项。
 
 ### WorkBuddy：微信扫码
 
@@ -284,6 +318,7 @@ jobs:
 | Trae 扫码后停在「无法访问此网站」              | 正常现象，官网只回送 127.0.0.1             | 复制该页地址栏的整段链接，回控制台按一次 `Ctrl+V`            |
 | Trae 登录页报「网络错误」                  | 打开的不是控制台生成的链接                    | 回控制台重新点「添加账号」，别手改链接里的回调地址                |
 | 粘贴后报「地址里没找到 authCodeInfo / code」 | 复制时漏了 `?` 后的部分，或复制成了搜索页地址        | 先把地址栏全选再复制                               |
+| 粘贴后报「host … 不在白名单内」             | 回调链接里的 `host` 不在允许列表             | 核对链接里的 `host=`；确实需要就配 `TRAE_ALLOWED_HOSTS`，见「兑换 host 白名单」 |
 | Trae 显示「限流 N 分钟」                 | 服务端 9074 限流                      | 等冷却结束，下一轮自动重试；加一条 00:20 的 cron 更容易补上     |
 | Trae 显示「令牌失效」                    | 很久没跑，或账号在别处登出过                   | 重新扫码                                     |
 | WorkBuddy 登录窗口是空白页               | 浏览器把 `about:blank` 当广告拦了，或代理没加载完 | 重新点一次；仍空白就在状态里点链接直接打开                    |
@@ -302,6 +337,8 @@ jobs:
 - 登录密码与账号令牌分离——泄露登录密码不等于泄露账号
 - 口令比较走定长比较，避免时序侧信道
 - 登录密码只存在浏览器 localStorage，Worker 侧不落盘、不下发 Cookie
+- 回调链接里的 `host` 走白名单校验，只有命中 `TRAE_ALLOWED_HOSTS`（默认两个官方域名）才会发出兑换请求，
+  避免粘贴到伪造链接时把 AuthCode / CodeVerifier / 设备公钥送到第三方域名
 - 页面零外部资源引用
 
 > 边界：令牌在 Worker 内存里必然有一刻是明文。云端能看到什么取决于你是否信任它——介意就部署到自己的账号下。
