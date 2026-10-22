@@ -472,11 +472,17 @@ async function statusOf(token, acct) {
   const r = await traeFetch(EP.status, { headers: ugHeaders(token, acct), body: REQ_BODY });
   if (!r.json) return { ok: false, code: '?', raw: String(r.text).slice(0, 160) };
   if (r.status >= 400) return { ok: false, code: r.json.code ?? -1, raw: String(r.text).slice(0, 160) };
+  // 这个网关的信封是 { code, message, data: {...} }，与 claim（读 r.json.data）和
+  // creditsOf（读 d.data || d）一致。旧实现直接读顶层 checked_in / credits，
+  // 结果 confirmed 永远为 false：签到成功后仍返回 pending、lastOkDate 不写、
+  // 控制台整天停在「待确认」、「本次」列是 —。data 缺失时再回退顶层，兼容老响应。
+  const d = r.json.data && typeof r.json.data === 'object' ? r.json.data : r.json;
+  const raw = d.checked_in;
   return {
     ok: true,
-    checked: r.json.checked_in === true,
-    credits: typeof r.json.credits === 'number' ? r.json.credits : null,
-    enable: r.json.enable ?? null,
+    checked: raw === true || raw === 1 || raw === 'true',
+    credits: typeof d.credits === 'number' ? d.credits : null,
+    enable: d.enable ?? null,
     code: r.json.code ?? -1,
   };
 }
