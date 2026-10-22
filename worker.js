@@ -1787,7 +1787,8 @@ async function signinOne(env, acct, { force = false } = {}) {
       streak = st.data.streak_days ?? null;
       total = st.data.total_credits ?? null;
       // 顺手把最新 accessToken 的服务端视图对上，用于判断是否真的已签
-      if (st.data.checked_in_today === true && result.state === 'error') {
+      // 字段名以实测为准：接口返回的是 today_checked_in，不是 checked_in_today
+      if (st.data.today_checked_in === true && result.state === 'error') {
         result = { state: 'already', credit: 0 };
       }
     }
