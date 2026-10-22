@@ -16,6 +16,9 @@
  *   Secret     MASTER_KEY    32 字节随机值的 base64，两个平台共用
  *   Secret     ADMIN_TOKEN   控制台登录密码
  *   Secret     CRON_SECRET   （可选）/cron 独立口令，缺省回落到 ADMIN_TOKEN
+ *   变量/Secret TRAE_ALLOWED_HOSTS（可选）Trae 兑换令牌的 host 白名单，逗号分隔，
+ *                            如 api.trae.cn,api.trae.com.cn；不配则用内置的这两个官方域名。
+ *                            回调链接里的 host 必须命中白名单，否则直接拒绝，避免凭据外发。
  *
  * 只认这几个名字，不需要按平台拆成多份绑定。
  *
@@ -892,12 +895,54 @@ function buildAuthorizeUrl(o) {
   return AUTHORIZE_BASE + '/authorization?' + params.map(([k, v]) => k + '=' + qsQuote(v)).join('&');
 }
 
-function hostBase(h) {
-  const s = String(h || '').trim();
-  if (!s) return 'https://api.trae.cn';
-  if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/, '');
-  return 'https://' + s.replace(/\/+$/, '');
+/* ---------------- 兑换令牌的目标 host 白名单 ---------------- */
+/* 回调链接（…&host=…）是用户在控制台手动粘贴进来的。若允许任意 host，
+   一条伪造的链接就能把 AuthCode、CodeVerifier 和设备公钥发到第三方域名。
+   默认只认 Trae 官方域名；需要扩展或切换时，给 Worker 配「变量」或 Secret
+   TRAE_ALLOWED_HOSTS（逗号分隔，如 api.trae.cn,api.trae.com.cn）。
+   配了就整体替换默认值，不用改代码重新部署。 */
+const DEFAULT_ALLOWED_HOSTS = ['api.trae.cn', 'api.trae.com.cn'];
+const DEFAULT_HOST_BASE = 'https://api.trae.cn';
+
+/** 归一化单个 host：去协议/路径、转小写；非法（含 user@、通配符、空标签）返回 '' */
+function normalizeHost(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return '';
+  // 只接受 主机名[:端口]
+  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::\d{1,5})?$/.test(s)) return '';
+  return s;
 }
+
+/** 读运行时白名单：TRAE_ALLOWED_HOSTS 优先，为空则回落到内置默认值 */
+function allowedHostsOf(env) {
+  const list = String((env && env.TRAE_ALLOWED_HOSTS) || '')
+    .split(/[,\s]+/)
+    .map(normalizeHost)
+    .filter(Boolean);
+  return list.length ? list : DEFAULT_ALLOWED_HOSTS.slice();
+}
+
+/** 校验并拼出 base：host 不在白名单直接抛错，绝不把凭据发去陌生域名 */
+function hostBase(h, allowed) {
+  const s = String(h || '').trim();
+  if (!s) return DEFAULT_HOST_BASE;
+  const list = Array.isArray(allowed) && allowed.length ? allowed : DEFAULT_ALLOWED_HOSTS;
+  // 拆成 host + 可选路径前缀（保留原行为，路径原样拼回去）
+  const m = /^(?:https?:\/\/)?([^/?#]+)(\/[^?#]*)?$/i.exec(s);
+  const host = m ? normalizeHost(m[1]) : '';
+  // 白名单比对只看主机名：api.trae.cn:443 应命中 api.trae.cn，
+  // 但 evil.com:443 仍然会被拒（域名不在名单里，端口不构成放行理由）。
+  const hostOnly = host.replace(/:\d+$/, '');
+  if (!host || !(list.includes(host) || list.includes(hostOnly))) {
+    throw new Error(
+      '回调链接里的 host「' + s.slice(0, 60) + '」不在白名单内（当前允许：' + list.join(', ') + '）。' +
+      '如确需使用，请给 Worker 配置变量或 Secret TRAE_ALLOWED_HOSTS（逗号分隔）。'
+    );
+  }
+  const prefix = (m[2] || '').replace(/\/+$/, '');
+  return 'https://' + host + prefix;
+}
+
 
 /** 递归找 token 字段：兑换响应外层结构各版本不一致 */
 function deepFind(obj, keys, depth = 0) {
@@ -973,7 +1018,7 @@ function describeExchangeErr(json, text, status) {
  *   主端点 DeviceInfo → 备用端点 AuthCode → 备用端点 Code
  * 这几步都不需要设备私钥，只要设备公钥已登记。
  */
-async function exchangeAuthCode({ authCode, verifier, device, clientId, platform, host }) {
+async function exchangeAuthCode({ authCode, verifier, device, clientId, platform, host, allowedHosts }) {
   const dev = {
     DeviceID: String(device.deviceId || ''),
     MachineID: String(device.machineId || ''),
@@ -1000,7 +1045,7 @@ async function exchangeAuthCode({ authCode, verifier, device, clientId, platform
   const variants = [
     {
       tag: 'DeviceInfo',
-      url: hostBase(host) + EP.exchange,
+      url: hostBase(host, allowedHosts) + EP.exchange,
       headers: { ...baseHeaders, 'x-cloudide-token': '' },
       body: {
         ClientID: clientId,
@@ -1162,6 +1207,7 @@ async function completeLogin(env, sess, p) {
       clientId: sess.clientId,
       platform: sess.platform,
       host: p.host,
+      allowedHosts: allowedHostsOf(env),
     });
     refreshToken = r.tokens.refreshToken;
     via = r.tag;
@@ -2095,6 +2141,8 @@ function traeEnv(env) {
     TRAE_MASTER_KEY: env.MASTER_KEY,
     ADMIN_TOKEN: env.ADMIN_TOKEN,
     CRON_SECRET: env.CRON_SECRET,
+    // 可选：逗号分隔的兑换令牌 host 白名单，为空则用模块内置的 Trae 官方域名
+    TRAE_ALLOWED_HOSTS: env.TRAE_ALLOWED_HOSTS,
   };
 }
 
