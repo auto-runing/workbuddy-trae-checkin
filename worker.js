@@ -19,6 +19,8 @@
  *   变量/Secret TRAE_ALLOWED_HOSTS（可选）Trae 兑换令牌的 host 白名单，逗号分隔，
  *                            如 api.trae.cn,api.trae.com.cn；不配则用内置的这两个官方域名。
  *                            回调链接里的 host 必须命中白名单，否则直接拒绝，避免凭据外发。
+ *   变量/Secret WECOM_WEBHOOK（可选）企业微信群机器人 webhook，每轮签到后推一条汇总；
+ *                            可填完整地址，也可只填 key（UUID）。不配则不推送。
  *
  * 只认这几个名字，不需要按平台拆成多份绑定。
  *
@@ -822,7 +824,21 @@ async function handleList(request, env) {
   return json({ count: out.length, today, accounts: out });
 }
 
-async function handleRun(request, env, force) {
+/** 汇总一次批量签到的结果（/api/run 与 Cron 共用同一形状） */
+function summarizeRun(results) {
+  return {
+    at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
+    accounts: results.length,
+    checked: results.filter((r) => r.state === 'checked').length,
+    already: results.filter((r) => ['already', 'skipped'].includes(r.state)).length,
+    failed: results.filter((r) => ['error', 'token_dead'].includes(r.state)).length,
+    cooling: results.filter((r) => ['rate', 'cooldown', 'pending'].includes(r.state)).length,
+    results,
+  };
+}
+
+/** 逐账号跑一遍，不经过 HTTP —— Cron 直接调用，不依赖 ADMIN_TOKEN */
+async function runEach(env, force) {
   const list = await listAccounts(env);
   const results = [];
   for (const meta of list) {
@@ -834,15 +850,11 @@ async function handleRun(request, env, force) {
       results.push({ id: a.id, label: a.label, state: 'error', msg: e.message });
     }
   }
-  return json({
-    at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
-    accounts: results.length,
-    checked: results.filter((r) => r.state === 'checked').length,
-    already: results.filter((r) => ['already', 'skipped'].includes(r.state)).length,
-    failed: results.filter((r) => ['error', 'token_dead'].includes(r.state)).length,
-    cooling: results.filter((r) => ['rate', 'cooldown', 'pending'].includes(r.state)).length,
-    results,
-  });
+  return summarizeRun(results);
+}
+
+async function handleRun(request, env, force) {
+  return json(await runEach(env, force));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1490,22 +1502,9 @@ const __mod = {
     }
   },
 
-  /** Cloudflare Cron Trigger 到点自动跑 */
+  /** 单独部署本平台时的 Cron 入口；根路径 Cron 由外壳统一调度并负责推送 */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        const list = await listAccounts(env);
-        for (const meta of list) {
-          const acct = await getAccount(env, meta.id);
-          if (!acct) continue;
-          try {
-            await signinOne(env, acct, { force: false });
-          } catch {
-            /* 单账号失败不影响其他账号 */
-          }
-        }
-      })()
-    );
+    ctx.waitUntil(runEach(env, false).then(() => {}));
   },
 };
 
@@ -1513,7 +1512,8 @@ const __mod = {
 const __internal = { ecSign, importPrivateKey, derSig, jwtExp, buildProof, PEM_TEST: true };
 
 
-return { fetch: __mod.fetch, scheduled: __mod.scheduled, __internal };
+// collectRun：供外壳的 Cron 直接驱动，返回与 /api/run 同形状的汇总
+return { fetch: __mod.fetch, scheduled: __mod.scheduled, collectRun: (env, force) => runEach(env, !!force), __internal };
 })();
 
 
@@ -2022,7 +2022,21 @@ async function handleRename(request, env) {
   return json({ ok: true, id, label });
 }
 
-async function handleRun(request, env, force) {
+/** 汇总一次批量签到的结果（/api/run 与 Cron 共用同一形状） */
+function summarizeRun(results) {
+  return {
+    at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
+    accounts: results.length,
+    checked: results.filter((r) => r.state === 'checked').length,
+    already: results.filter((r) => r.state === 'already' || r.state === 'skipped').length,
+    failed: results.filter((r) => r.state === 'error' || r.state === 'token_dead').length,
+    cooling: results.filter((r) => r.state === 'cooldown' || r.state === 'pending').length,
+    results,
+  };
+}
+
+/** 逐账号跑一遍，不经过 HTTP —— Cron 直接调用，不依赖 ADMIN_TOKEN */
+async function runEach(env, force) {
   const list = await listAccounts(env);
   const results = [];
   for (const meta of list) {
@@ -2034,15 +2048,11 @@ async function handleRun(request, env, force) {
       results.push({ id: a.id, label: a.label, state: 'error', msg: e.message });
     }
   }
-  const summary = {
-    at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
-    accounts: results.length,
-    checked: results.filter((r) => r.state === 'checked').length,
-    already: results.filter((r) => r.state === 'already' || r.state === 'skipped').length,
-    failed: results.filter((r) => r.state === 'error' || r.state === 'token_dead').length,
-    results,
-  };
-  return json(summary);
+  return summarizeRun(results);
+}
+
+async function handleRun(request, env, force) {
+  return json(await runEach(env, force));
 }
 
 const PAGE = '<!DOCTYPE html><meta charset="utf-8"><title>控制台</title><p>控制台在根路径 <a href="/">/</a>。</p>';
@@ -2092,27 +2102,15 @@ const __mod = {
     }
   },
 
-  /** Cloudflare Cron Trigger 到点自动跑 */
+  /** 单独部署本平台时的 Cron 入口；根路径 Cron 由外壳统一调度并负责推送 */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      (async () => {
-        const list = await listAccounts(env);
-        for (const meta of list) {
-          const acct = await getAccount(env, meta.id);
-          if (!acct) continue;
-          try {
-            await signinOne(env, acct, { force: false });
-          } catch {
-            /* 单账号失败不影响其他账号 */
-          }
-        }
-      })()
-    );
+    ctx.waitUntil(runEach(env, false).then(() => {}));
   },
 };
 
 
-return { fetch: __mod.fetch, scheduled: __mod.scheduled };
+// collectRun：供外壳的 Cron 直接驱动，返回与 /api/run 同形状的汇总
+return { fetch: __mod.fetch, scheduled: __mod.scheduled, collectRun: (env, force) => runEach(env, !!force) };
 })();
 
 
@@ -2265,6 +2263,133 @@ async function runAll(env, origin, force) {
     at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
     ...out,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* 企业微信群机器人推送                                                 */
+/*                                                                     */
+/* 与环境变量注册方式一致：配了 WECOM_WEBHOOK 就启用，不配整段静默跳过。 */
+/*   - 完整地址：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=… */
+/*   - 或只填 key（群机器人 Webhook 地址里 key= 后面那串）              */
+/* 推送失败只写日志，绝不影响签到结果本身。                             */
+/* ------------------------------------------------------------------ */
+
+const WECOM_HOST = 'qyapi.weixin.qq.com';
+const WECOM_MAX_BYTES = 4000; // 官方 markdown 上限 4096 字节，留点余量
+
+const bjClock = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(11, 16);
+
+/** 解析配置：接受完整 webhook 地址或裸 key；非法/为空返回 '' */
+function wecomUrlOf(env) {
+  const raw = String((env && env.WECOM_WEBHOOK) || '').trim();
+  if (!raw) return '';
+  if (!/\//.test(raw)) {
+    // 裸 key 只允许 UUID 形态，host 写死，绝不让配置变成任意地址
+    return /^[0-9a-fA-F-]{20,}$/.test(raw)
+      ? 'https://' + WECOM_HOST + '/cgi-bin/webhook/send?key=' + raw
+      : '';
+  }
+  try {
+    const u = new URL(raw);
+    // 只认官方域名，避免配错成第三方地址把签到结果外发
+    if (u.protocol !== 'https:' || u.hostname !== WECOM_HOST) return '';
+    return u.toString();
+  } catch {
+    return '';
+  }
+}
+
+/** 按字节裁剪，中文一字符 3 字节，超长会被服务端整条拒收 */
+function clipBytes(s, max) {
+  const str = String(s || '');
+  const enc = new TextEncoder();
+  if (enc.encode(str).length <= max) return str;
+  let out = '';
+  for (const ch of str) {
+    if (enc.encode(out + ch).length > max - 3) break;
+    out += ch;
+  }
+  return out + '…';
+}
+
+/** 发一条 markdown 消息；永远 resolve，不抛 */
+async function pushWecom(env, content) {
+  const url = wecomUrlOf(env);
+  if (!url) return { ok: false, skipped: '未配置 WECOM_WEBHOOK' };
+  const body = JSON.stringify({
+    msgtype: 'markdown',
+    markdown: { content: clipBytes(content, WECOM_MAX_BYTES) },
+  });
+  try {
+    const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
+    if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) init.signal = AbortSignal.timeout(8000);
+    const r = await fetch(url, init);
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j || j.errcode !== 0) {
+      return { ok: false, error: (j && j.errmsg) || 'HTTP ' + r.status };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
+function accountLine(r) {
+  const name = r.label || r.id || '账号';
+  switch (r.state) {
+    case 'checked':
+      return name + '：签到成功' + (r.points != null ? ' <font color="warning">+' + r.points + '</font>' : '');
+    case 'already':
+      return name + '：今日已签';
+    case 'skipped':
+      return name + '：今日已完成';
+    case 'rate':
+      return name + '：限流冷却中';
+    case 'cooldown':
+      return name + '：冷却中';
+    case 'pending':
+      return name + '：已提交，待确认';
+    case 'token_dead':
+      return name + '：<font color="warning">令牌失效，需重新扫码</font>';
+    default:
+      return name + '：<font color="warning">失败</font>' + (r.msg ? '（' + r.msg + '）' : '');
+  }
+}
+
+function buildNotifyText(out) {
+  const at = String((out && out.at) || '').replace('T', ' ').slice(0, 16) || bjClock();
+  const lines = ['## 签到结果 · ' + at];
+  for (const [key, name] of [['trae', 'Trae'], ['wb', 'WorkBuddy']]) {
+    const p = out && out[key];
+    if (!p) continue;
+    if (p.error) {
+      lines.push('**' + name + '**：异常 ' + p.error);
+      continue;
+    }
+    const rs = Array.isArray(p.results) ? p.results : [];
+    if (!rs.length) {
+      lines.push('**' + name + '**：暂无账号');
+      continue;
+    }
+    const bits = ['成功 ' + (p.checked || 0), '已签 ' + (p.already || 0)];
+    if (p.failed) bits.push('失败 ' + p.failed);
+    if (p.cooling) bits.push('冷却 ' + p.cooling);
+    lines.push('**' + name + '**　' + bits.join(' · '));
+    for (const r of rs.slice(0, 8)) lines.push('> ' + accountLine(r));
+    if (rs.length > 8) lines.push('> …另 ' + (rs.length - 8) + ' 个账号');
+  }
+  return lines.join('\n');
+}
+
+/** 统一推送入口：未配置直接返回；任何异常都吞掉，不能影响签到 */
+async function notifyRun(env, out) {
+  if (!wecomUrlOf(env)) return;
+  try {
+    const r = await pushWecom(env, buildNotifyText(out));
+    if (!r.ok) console.warn('[wecom] 推送失败：' + (r.error || r.skipped || '未知'));
+  } catch (e) {
+    console.warn('[wecom] 推送异常：' + (e && e.message ? e.message : String(e)));
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -3017,7 +3142,9 @@ export default {
       if (path === '/cron') {
         const c = requireCron(request, env);
         if (!c.ok) return c.res;
-        return json(await runAll(env, url.origin, false));
+        const result = await runAll(env, url.origin, false);
+        ctx.waitUntil(notifyRun(env, result));
+        return json(result);
       }
 
       // Trae 的授权链接里回调地址写死为 <origin>/oauth/callback，必须留在根路径
@@ -3035,7 +3162,9 @@ export default {
         const a = requireAdmin(request, env);
         if (!a.ok) return a.res;
         const force = url.searchParams.get('force') === '1';
-        return json(await runAll(env, url.origin, force));
+        const result = await runAll(env, url.origin, force);
+        ctx.waitUntil(notifyRun(env, result));
+        return json(result);
       }
 
       // 平台命名空间：/trae/api/* → 模块内的 /api/*
@@ -3053,23 +3182,24 @@ export default {
     }
   },
 
-  /** Cloudflare Cron Trigger：两个平台依次签到，互不影响 */
+  /** Cloudflare Cron Trigger：两个平台依次签到，互不影响；结束后推一条企微消息 */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
-        const pending = [];
-        const sink = { waitUntil: (p) => pending.push(p) };
-        for (const [mod, e] of [
-          [Trae, traeEnv(env)],
-          [WorkBuddy, wbEnv(env)],
+        const out = {};
+        for (const [key, mod, e] of [
+          ['trae', Trae, traeEnv(env)],
+          ['wb', WorkBuddy, wbEnv(env)],
         ]) {
           try {
-            await mod.scheduled({}, e, sink);
-          } catch {
-            /* 一个平台整体失败不影响另一个 */
+            // 直接驱动模块，不经过 /api/run，因此不依赖 ADMIN_TOKEN
+            out[key] = await mod.collectRun(e, false);
+          } catch (err) {
+            out[key] = { error: err.message || String(err) };
           }
         }
-        await Promise.allSettled(pending);
+        out.at = new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00');
+        await notifyRun(env, out);
       })()
     );
   },
