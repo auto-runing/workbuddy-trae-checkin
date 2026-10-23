@@ -514,6 +514,20 @@ async function creditsOf(token, acct) {
   return found ? sum : null;
 }
 
+/**
+ * 「本次」增量：优先用 claim 返回的 points；接口没回 points 时，
+ * 用签到前后余额差值兜底（标记为估算，前端加 ≈ 前缀）。
+ * 余额会被日常消耗拉低，所以差值只会偏小，不会凭空造数。
+ */
+function pickGain(points, balAfter, balBefore) {
+  if (typeof points === 'number' && points > 0) return { value: points, estimated: false };
+  if (typeof balAfter === 'number' && typeof balBefore === 'number') {
+    const diff = Math.round((balAfter - balBefore) * 100) / 100;
+    if (diff > 0) return { value: diff, estimated: true };
+  }
+  return { value: null, estimated: false };
+}
+
 /* ------------------------------------------------------------------ */
 /* KV 读写                                                             */
 /* ------------------------------------------------------------------ */
@@ -560,6 +574,8 @@ async function signinOne(env, acct, { force = false } = {}) {
   const now = Date.now();
   const today = bjDay(now);
   const base = { id: acct.id, label: acct.label };
+  // 签到前的余额，用于 claim 不回 points 时按差值估算「本次」增量
+  const balBefore = typeof acct.credits === 'number' ? acct.credits : null;
 
   if (!force && Number(acct.cooldownUntil || 0) > now) {
     const left = Math.ceil((acct.cooldownUntil - now) / 60000);
@@ -637,6 +653,11 @@ async function signinOne(env, acct, { force = false } = {}) {
       acct.credits = st.credits ?? acct.credits ?? null;
       acct.checkedIn = true;
     }
+    // 这一轮没有产生增量：只有今天确实记录过，才把「本次」留给前端展示
+    if (acct.lastCreditDate !== today) {
+      acct.lastCredit = null;
+      acct.gainEstimated = false;
+    }
     await putAccount(env, acct);
     return { ...base, state: 'already', msg: '今日已签', credits: acct.credits ?? null };
   }
@@ -673,11 +694,16 @@ async function signinOne(env, acct, { force = false } = {}) {
   }
 
   const bal = await creditsOf(token, acct).catch(() => null);
+  const gained = pickGain(res.points, bal, balBefore);
   acct.lastState = 'checked';
-  acct.lastMsg = res.points ? `+${res.points} 积分` : '签到成功';
+  acct.lastMsg = gained.value == null
+    ? '签到成功'
+    : '+' + gained.value + ' 积分' + (gained.estimated ? '（按余额差值估算）' : '');
   acct.lastOkDate = today;
-  acct.lastCredit = res.points ?? null;
-  acct.totalCredit = (acct.totalCredit ?? 0) + (Number(res.points) || 0);
+  acct.lastCredit = gained.value;
+  acct.lastCreditDate = today;      // 只有带日期的增量才在控制台展示
+  acct.gainEstimated = gained.estimated;
+  acct.totalCredit = (acct.totalCredit ?? 0) + (gained.value || 0);
   acct.totalSigned = (acct.totalSigned ?? 0) + 1;
   acct.credits = bal ?? credits ?? acct.credits ?? null;
   acct.checkedIn = true;
@@ -689,7 +715,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     state: 'checked',
     msg: acct.lastMsg,
     credits: acct.credits ?? null,
-    points: res.points ?? null,
+    points: gained.value,
   };
 }
 
@@ -777,6 +803,9 @@ async function handleList(request, env) {
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
       lastCredit: a.lastCredit ?? null,
+      // 「本次」只在增量确实属于今天时才下发，避免把昨天/上一次的 +100 跨天带出来
+      gainToday: a.lastCreditDate === today ? (a.lastCredit ?? null) : null,
+      gainEstimated: !!a.gainEstimated,
       credits: typeof a.credits === 'number' ? Math.round(a.credits * 100) / 100 : null,
       totalCredit: a.totalCredit ?? 0,
       totalSigned: a.totalSigned ?? 0,
@@ -2645,7 +2674,7 @@ function renderTrae(d){
   box.innerHTML = '<table><thead><tr><th>备注</th><th>状态</th><th>本次</th><th>余额</th><th>上次运行</th><th></th></tr></thead><tbody>'
     + d.accounts.map(function(a){
         var m = msgTrae(a);
-        var gain = (a.lastState==='checked' && a.lastCredit!=null) ? '+' + a.lastCredit : '—';
+        var gain = a.gainToday != null ? (a.gainEstimated ? '≈+' : '+') + a.gainToday : '—';
         return '<tr>'
           + '<td class="labcell" data-label="备注">' + labCellHtml('trae', a.id, a.label) + '</td>'
           + '<td class="st" data-label="状态">' + tagTrae(a, now)
