@@ -19,7 +19,8 @@
  *   变量/Secret TRAE_ALLOWED_HOSTS（可选）Trae 兑换令牌的 host 白名单，逗号分隔，
  *                            如 api.trae.cn,api.trae.com.cn；不配则用内置的这两个官方域名。
  *                            回调链接里的 host 必须命中白名单，否则直接拒绝，避免凭据外发。
- *   变量/Secret WECOM_WEBHOOK（可选）企业微信群机器人 webhook，每轮签到后推一条汇总；
+ *   变量/Secret WECOM_WEBHOOK（可选）企业微信群机器人 webhook，每轮签到后推一条纯文本汇总
+ *                            （签到时间 / 本次积分 / Trae 剩余、WorkBuddy 本期）；
  *                            可填完整地址，也可只填 key（UUID）。不配则不推送。
  *
  * 只认这几个名字，不需要按平台拆成多份绑定。
@@ -581,11 +582,11 @@ async function signinOne(env, acct, { force = false } = {}) {
 
   if (!force && Number(acct.cooldownUntil || 0) > now) {
     const left = Math.ceil((acct.cooldownUntil - now) / 60000);
-    return { ...base, state: 'cooldown', msg: `限流冷却中，约 ${left} 分钟` };
+    return { ...base, state: 'cooldown', msg: `限流冷却中，约 ${left} 分钟`, credits: acct.credits ?? null };
   }
 
   if (!force && acct.lastOkDate === today) {
-    return { ...base, state: 'skipped', msg: '今日已完成' };
+    return { ...base, state: 'skipped', msg: '今日已完成', points: 0, credits: acct.credits ?? null };
   }
 
   // 1) 拿一个可用的 accessToken：还没过期就直接用，避免无谓轮换
@@ -1825,7 +1826,15 @@ async function signinOne(env, acct, { force = false } = {}) {
 
   // 今天已成功过、且没要求强制，直接跳过（省一次请求，也避免无谓刷新）
   if (!force && acct.lastOkDate === today && acct.lastState !== 'error') {
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成' };
+    return {
+      id: acct.id,
+      label: acct.label,
+      state: 'skipped',
+      msg: '今日已完成',
+      points: 0,
+      total: acct.total ?? null,
+      streak: acct.streak ?? null,
+    };
   }
 
   let tokens;
@@ -1894,6 +1903,8 @@ async function signinOne(env, acct, { force = false } = {}) {
     label: acct.label,
     state: acct.lastState,
     msg: acct.lastMsg,
+    // points 是本次的增量，total 是本期累计积分（weekly/season 活动口径）
+    points: result.state === 'checked' ? (Number(result.credit) || 0) : result.state === 'already' ? 0 : null,
     streak,
     total,
   };
@@ -2275,7 +2286,7 @@ async function runAll(env, origin, force) {
 /* ------------------------------------------------------------------ */
 
 const WECOM_HOST = 'qyapi.weixin.qq.com';
-const WECOM_MAX_BYTES = 4000; // 官方 markdown 上限 4096 字节，留点余量
+const WECOM_MAX_BYTES = 2000; // 官方 text.content 上限 2048 字节，留点余量
 
 const bjClock = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(11, 16);
 
@@ -2312,13 +2323,13 @@ function clipBytes(s, max) {
   return out + '…';
 }
 
-/** 发一条 markdown 消息；永远 resolve，不抛 */
+/** 发一条纯文本消息；永远 resolve，不抛 */
 async function pushWecom(env, content) {
   const url = wecomUrlOf(env);
   if (!url) return { ok: false, skipped: '未配置 WECOM_WEBHOOK' };
   const body = JSON.stringify({
-    msgtype: 'markdown',
-    markdown: { content: clipBytes(content, WECOM_MAX_BYTES) },
+    msgtype: 'text',
+    text: { content: clipBytes(content, WECOM_MAX_BYTES) },
   });
   try {
     const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
@@ -2334,49 +2345,96 @@ async function pushWecom(env, content) {
   }
 }
 
-function accountLine(r) {
+/** 千分位，积分上千时更好认 */
+function fmtNum(n) {
+  if (n == null || n === '') return '—';
+  const v = Number(n);
+  if (!Number.isFinite(v)) return '—';
+  return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/** 本次增量：已签/跳过记 +0，拿不到记 — */
+function gainText(r) {
+  if (r.state === 'already' || r.state === 'skipped') return '+0';
+  if (typeof r.points !== 'number') return '—';
+  return (r.points > 0 ? '+' : '') + fmtNum(r.points);
+}
+
+/**
+ * 单账号一行纯文本。
+ * Trae 展示「剩余」（额度余额），WorkBuddy 展示「本期」（活动累计积分）。
+ */
+function accountLine(r, key) {
   const name = r.label || r.id || '账号';
+  const bits = [];
   switch (r.state) {
     case 'checked':
-      return name + '：签到成功' + (r.points != null ? ' <font color="warning">+' + r.points + '</font>' : '');
+      bits.push('签到成功', '本次 ' + gainText(r));
+      break;
     case 'already':
-      return name + '：今日已签';
+      bits.push('今日已签', '本次 +0');
+      break;
     case 'skipped':
-      return name + '：今日已完成';
+      bits.push('今日已完成', '本次 +0');
+      break;
     case 'rate':
-      return name + '：限流冷却中';
+      bits.push('限流冷却中');
+      break;
     case 'cooldown':
-      return name + '：冷却中';
+      bits.push('冷却中' + (r.msg ? '（' + r.msg + '）' : ''));
+      break;
     case 'pending':
-      return name + '：已提交，待确认';
+      bits.push('已提交待确认', '本次 —');
+      break;
     case 'token_dead':
-      return name + '：<font color="warning">令牌失效，需重新扫码</font>';
+      bits.push('令牌失效，需重新扫码');
+      break;
     default:
-      return name + '：<font color="warning">失败</font>' + (r.msg ? '（' + r.msg + '）' : '');
+      bits.push('失败' + (r.msg ? '（' + r.msg + '）' : ''));
   }
+  if (key === 'wb') {
+    if (r.total != null) bits.push('本期 ' + fmtNum(r.total));
+    if (r.streak != null) bits.push('连续 ' + r.streak + ' 天');
+  } else if (r.credits != null) {
+    bits.push('剩余 ' + fmtNum(r.credits));
+  }
+  return '· ' + name + '：' + bits.join('，');
 }
 
 function buildNotifyText(out) {
   const at = String((out && out.at) || '').replace('T', ' ').slice(0, 16) || bjClock();
-  const lines = ['## 签到结果 · ' + at];
+  const lines = ['【签到结果】' + at];
+
+  const sum = { checked: 0, already: 0, failed: 0, cooling: 0 };
+  for (const key of ['trae', 'wb']) {
+    const p = out && out[key];
+    if (!p) continue;
+    sum.checked += p.checked || 0;
+    sum.already += p.already || 0;
+    sum.failed += p.failed || 0;
+    sum.cooling += p.cooling || 0;
+  }
+  const head = ['成功 ' + sum.checked, '已签 ' + sum.already];
+  if (sum.failed) head.push('失败 ' + sum.failed);
+  if (sum.cooling) head.push('冷却 ' + sum.cooling);
+  lines.push(head.join(' · '));
+
   for (const [key, name] of [['trae', 'Trae'], ['wb', 'WorkBuddy']]) {
     const p = out && out[key];
     if (!p) continue;
+    lines.push('');
     if (p.error) {
-      lines.push('**' + name + '**：异常 ' + p.error);
+      lines.push(name + '：异常 ' + p.error);
       continue;
     }
     const rs = Array.isArray(p.results) ? p.results : [];
     if (!rs.length) {
-      lines.push('**' + name + '**：暂无账号');
+      lines.push(name + '：暂无账号');
       continue;
     }
-    const bits = ['成功 ' + (p.checked || 0), '已签 ' + (p.already || 0)];
-    if (p.failed) bits.push('失败 ' + p.failed);
-    if (p.cooling) bits.push('冷却 ' + p.cooling);
-    lines.push('**' + name + '**　' + bits.join(' · '));
-    for (const r of rs.slice(0, 8)) lines.push('> ' + accountLine(r));
-    if (rs.length > 8) lines.push('> …另 ' + (rs.length - 8) + ' 个账号');
+    lines.push(name);
+    for (const r of rs.slice(0, 8)) lines.push(accountLine(r, key));
+    if (rs.length > 8) lines.push('· …另 ' + (rs.length - 8) + ' 个账号');
   }
   return lines.join('\n');
 }
